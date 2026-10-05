@@ -196,10 +196,11 @@ func (s *Session) Open() error {
 	// mutex lock and needs to exist before calling heartbeat and listen
 	// go rountines.
 	s.listening = make(chan interface{})
+	s.wsReadDone = make(chan struct{})
 
 	// Start sending heartbeats and reading messages from Discord.
 	go s.heartbeat(s.wsConn, s.listening, h.HeartbeatInterval)
-	go s.listen(s.wsConn, s.listening)
+	go s.listen(s.wsConn, s.listening, s.wsReadDone)
 
 	s.log(LogInformational, "exiting")
 	return nil
@@ -207,7 +208,7 @@ func (s *Session) Open() error {
 
 // listen polls the websocket connection for events, it will stop when the
 // listening channel is closed, or an error occurs.
-func (s *Session) listen(wsConn *websocket.Conn, listening <-chan interface{}) {
+func (s *Session) listen(wsConn *websocket.Conn, listening <-chan interface{}, readDone chan<- struct{}) {
 
 	s.log(LogInformational, "called")
 
@@ -216,6 +217,11 @@ func (s *Session) listen(wsConn *websocket.Conn, listening <-chan interface{}) {
 		messageType, message, err := wsConn.ReadMessage()
 
 		if err != nil {
+
+			// Signal that the connection has been closed before taking the
+			// lock below, as CloseWithCode holds the lock while it waits for
+			// this.
+			close(readDone)
 
 			// Detect if we have been closed manually. If a Close() has already
 			// happened, the websocket we are listening on will be different to
@@ -244,7 +250,11 @@ func (s *Session) listen(wsConn *websocket.Conn, listening <-chan interface{}) {
 		select {
 
 		case <-listening:
-			return
+			// Close has been called. Keep reading, without handling events,
+			// so that the server's close frame is read and CloseWithCode can
+			// stop waiting. Reading returns an error once the connection is
+			// closed, which ends the loop above.
+			continue
 
 		default:
 			s.onEvent(messageType, message)
@@ -968,8 +978,14 @@ func (s *Session) CloseWithCode(closeCode int) (err error) {
 			s.log(LogInformational, "error closing websocket, %s", err)
 		}
 
-		// TODO: Wait for Discord to actually close the connection.
-		time.Sleep(1 * time.Second)
+		// Wait for Discord to close the connection, which listen signals by
+		// closing wsReadDone, for up to a second. If nothing is listening,
+		// wsReadDone is nil and this waits for the full second.
+		select {
+		case <-s.wsReadDone:
+		case <-time.After(1 * time.Second):
+		}
+		s.wsReadDone = nil
 
 		s.log(LogInformational, "closing gateway websocket")
 		err = s.wsConn.Close()
