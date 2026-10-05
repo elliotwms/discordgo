@@ -123,6 +123,11 @@ type Session struct {
 	// When nil, the session is not listening.
 	listening chan interface{}
 
+	// Closed by listen when reading from the websocket fails, which is how the
+	// server closing the connection is surfaced. CloseWithCode waits on it so
+	// that it doesn't have to wait for a fixed time.
+	wsReadDone chan struct{}
+
 	// sequence tracks the current gateway api websocket sequence number
 	sequence *int64
 
